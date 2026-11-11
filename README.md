@@ -1,24 +1,35 @@
-# 云客跟进助手
+# 云客跟进助手 | Yunke CRM Follow-up Assistant
 
-这是公开源码仓库。完整源码包在 [`yunke-follow-up-assistant-source-v1.23.0.zip`](./yunke-follow-up-assistant-source-v1.23.0.zip) 中，下载并解压后可看到桌面扩展和手机端源码。觉得有用的话，欢迎在 GitHub 点 Star。
+**非官方项目 / Unofficial project.** 为云客 CRM 页面提供浏览器扩展与 Android 手机联动源码，帮助查看通话状态、发起手机挂断请求、同步 CRM 页面，并快捷填写跟进结果。
 
-## 源码内容
+觉得有用，欢迎在 GitHub 点 **Star**。完整源码包：[`yunke-follow-up-assistant-source-v1.23.0.zip`](./yunke-follow-up-assistant-source-v1.23.0.zip)。
 
-- `desktop-extension/`：Chrome Manifest V3 扩展源码，版本 1.23.0。手动挂断不再被 CRM 客户匹配阻断；若手机未回执，只在确认仍是同一通电话时补发一次挂断命令；客户页未唯一匹配时暂停跟进录入，避免写错客户。
-- `mobile-app/`：手机端 APK 反编译后的 smali 与资源源码，改动版本 1.56。
+## 界面预览
 
-## 桌面扩展密钥配置
+下图为扩展通话面板示例，截图来自 v1.22.8；当前桌面扩展源码为 v1.23.0。
 
-出于安全考虑，源码包不包含中转服务鉴权密钥。扩展从云客 CRM 页面自己的 `localStorage` 读取 `yk_relay_access_key`。部署前请在受信任的 CRM 页面控制台设置：
+![云客跟进助手通话面板预览](./panel-preview-v1.22.8.png)
 
-```js
-localStorage.setItem('yk_relay_access_key', '你的中转服务密钥')
-```
+## 功能
 
-真实密钥不要提交到 Git。设置后，在 Chrome“扩展程序”页面开启开发者模式并加载解压后的 `desktop-extension/` 文件夹。
+- 来电与拨号状态提示、快捷键控制。
+- 通过手机 APK 请求挂断；未收到手机状态回执时，仅在确认还是同一通电话的情况下补发一次。
+- 通话结束后协助同步 CRM 通话结果和跟进记录。
+- CRM 客户无法唯一匹配时暂停跟进录入，避免写到错误客户。
 
-## 手机端说明
+## 源码
 
-手机端源码是 APK 反编译后的 smali 与资源，便于审阅和重建；没有包含 APK 成品、签名密钥库或签名密码。覆盖安装仍需使用原应用的签名证书。
+- `desktop-extension/`：Chrome Manifest V3 扩展源码，版本 1.23.0。
+- `mobile-app/`：APK 反编译后的 smali 与资源源码，版本 1.56；没有附 APK 成品或签名材料。
 
-仓库没有包含客户名单、通话记录、APK 成品或签名材料。目前未附开源许可证；公开可见和 Star 不等于授权他人独立复制、修改、再发布或商用。手机端反编译代码的授权范围也尚需确认。
+## 安装桌面扩展
+
+1. 下载并解压源码包。
+2. 打开 Chrome `chrome://extensions`，开启“开发者模式”，加载解压后的 `desktop-extension/` 文件夹。
+3. 按部署环境配置中转服务密钥。源码包不包含密钥；扩展从 CRM 页面 `localStorage` 读取 `yk_relay_access_key`。
+
+真实密钥不要提交到 Git。覆盖安装手机端仍需原应用的签名证书。
+
+## 项目说明
+
+仓库未包含客户名单、通话记录、APK 成品或签名材料。目前**未附开源许可证**，公开可见不等于授权复制、修改、再发布或商用。手机端反编译代码的授权范围也尚需确认。

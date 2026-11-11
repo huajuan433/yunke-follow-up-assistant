@@ -1,10 +1,10 @@
 # 云客跟进助手
 
-这是公开源码仓库。完整源码包在 [`yunke-follow-up-assistant-source-v1.22.9.zip`](./yunke-follow-up-assistant-source-v1.22.9.zip) 中，下载并解压后可看到桌面扩展和手机端源码。觉得有用的话，欢迎在 GitHub 点 Star。
+这是公开源码仓库。完整源码包在 [`yunke-follow-up-assistant-source-v1.23.0.zip`](./yunke-follow-up-assistant-source-v1.23.0.zip) 中，下载并解压后可看到桌面扩展和手机端源码。觉得有用的话，欢迎在 GitHub 点 Star。
 
 ## 源码内容
 
-- `desktop-extension/`：Chrome Manifest V3 扩展源码，版本 1.22.9。手动挂断不再被 CRM 客户匹配阻断；客户页未唯一匹配时暂停跟进录入，避免写错客户。
+- `desktop-extension/`：Chrome Manifest V3 扩展源码，版本 1.23.0。手动挂断不再被 CRM 客户匹配阻断；若手机未回执，只在确认仍是同一通电话时补发一次挂断命令；客户页未唯一匹配时暂停跟进录入，避免写错客户。
 - `mobile-app/`：手机端 APK 反编译后的 smali 与资源源码，改动版本 1.56。
 
 ## 桌面扩展密钥配置

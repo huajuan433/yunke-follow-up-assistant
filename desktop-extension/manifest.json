@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "云客CRM跟进助手",
+  "version": "1.24.0",
+  "description": "挂断事件持久补偿、唯一客户匹配、CRM 跟进自动提交；支持中文输入法快捷操作。",
+  "permissions": [
+    "storage",
+    "clipboardWrite",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://apis.juhe.cn/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "bg.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://crm.yunkecn.com/*",
+        "*://*.yunkecn.com/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://crm.yunkecn.com/*",
+        "*://*.yunkecn.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}
+

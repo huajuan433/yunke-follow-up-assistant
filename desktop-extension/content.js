@@ -4,7 +4,7 @@
   // 页面真实 window（油猴沙盒模式下用 unsafeWindow，扩展 MAIN 世界即 window 本身）
   const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  const YK_BUILD = '1.24.0';
+  const YK_BUILD = '1.24.1';
   if (PW.__YK_CRM_HELPER__) {
     // 插件版和油猴版都跑在页面 MAIN world，谁先加载谁干活，后到的必须退出——
     // 以前这里是静默 return，于是"我改了怎么没生效"根本查不出是被另一份（旧版本）占了坑。
@@ -1928,6 +1928,39 @@
   // CRM 页面同步按钮点击时间：用于识别同一次挂断回报，避免重复点击页面。
   let lastCrmHangupSyncAt = 0;
 
+  // 手动结果流程先请求手机挂断。若手机随后回执了同一通已结束，趁结果表单提交前
+  // 先把 CRM 页面状态同步好，避免先提交被“请挂断电话”拦截、再同步、再提交的往返。
+  function manualHangupConfirmedFor(snapshot) {
+    if (!snapshot || !phoneCallEndedFresh() || newCallDialing()) return false;
+    const ph = PW.__ykPhRow || {};
+    const currentNumber = String(ph.number || '').replace(/\D/g, '');
+    const sameNumber = !snapshot.number || !currentNumber || currentNumber === snapshot.number;
+    const transitioned = Number(ph.stateAt || 0) > Number(snapshot.stateAt || 0) ||
+      String(ph.state || '').toLowerCase() !== String(snapshot.state || '').toLowerCase();
+    return sameNumber && transitioned;
+  }
+  async function syncCrmHangupAfterManualConfirm(log, snapshot) {
+    if (!manualHangupConfirmedFor(snapshot)) return false;
+    if (hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束')) {
+      return true;
+    }
+    for (const label of HANGUP_TEXTS) {
+      const all = findClickablesByText(label).filter((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent)));
+      const btn = all.find((el) => getClickableAncestor(el).tagName === 'BUTTON') || all[0] || null;
+      if (!btn) continue;
+      if (!realClick(getClickableAncestor(btn))) return false;
+      lastCrmHangupSyncAt = Date.now();
+      log.push('手机已确认本通挂断，提前同步 CRM 页面状态');
+      const ended = await waitUntil(() =>
+        hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束') ||
+        (findClickablesByText('挂断').length === 0 && !hasVisibleText('通话中')), 900, 60
+      );
+      if (ended) log.push('CRM 挂断状态已同步，直接提交一次');
+      return ended;
+    }
+    return false;
+  }
+
   async function runFlow(flow, opts) {
     if (running) {
       if (opts && opts.pendingEventId && typeof PW.__YK_PENDING_UPDATE__ === 'function') {
@@ -1942,9 +1975,11 @@
     // [v1.19.4] 每条日志都带上从流程开始算起的毫秒：「手机挂了、电脑半天才动」到底慢在哪一段
     // （等页面确认通话结束 / 展开结果 tab / 提交被拦再补挂），提示条和中转表里直接能看见。
     const tFlow0 = Date.now();
+    const fastFlow = !!(opts && (opts.trigger === '联动' || opts.pendingEventId || opts.evAt || opts.trigger === '挂断事件自动补偿'));
     let submitOutcome = 'not-submitted';
     let submitClicked = false;
     let manualHangupCommandSent = false;
+    let manualHangupSnapshot = null;
     let manualCrmFollowupBlocked = false;
     const slowPhases = [];
     const logPushRaw = log.push.bind(log);
@@ -1986,6 +2021,11 @@
             if (typeof PW.__YK_MANUAL_PHONE_ACTIVE__ === 'function' && PW.__YK_MANUAL_PHONE_ACTIVE__()) {
               const commandAt = Date.now();
               const mobileBeforeHangup = PW.__ykPhRow || {};
+              manualHangupSnapshot = {
+                state: String(mobileBeforeHangup.state || '').toLowerCase(),
+                stateAt: Number(mobileBeforeHangup.stateAt) || 0,
+                number: String(mobileBeforeHangup.number || '').replace(/\D/g, ''),
+              };
               const manualFlowMarker = { at: commandAt, number: String(mobileBeforeHangup.number || '') };
               PW.__YK_MANUAL_FLOW_HANGUP__ = manualFlowMarker;
               try { localStorage.setItem('yk_manual_flow_hangup_v1', JSON.stringify(manualFlowMarker)); } catch (e) {}
@@ -2091,6 +2131,14 @@
               log.push(message);
               ykStatusUpdate({ progress: '手动挂断继续 · CRM 跟进暂停', outcome: '客户页未唯一匹配' });
             }
+          }
+          // 手机状态轮询与结果按钮点击并行。最多额外等 300ms 捕获刚到的本通挂断回执；
+          // 只有客户详情仍匹配、手机明确结束同一通且没有下一通在拨时，才提前同步 CRM。
+          // 没等到回执就走原兜底，不额外拖慢流程，也不碰手机上的下一通。
+          if (!autoTrigger && manualHangupCommandSent && manualHangupSnapshot && !manualCrmFollowupBlocked &&
+              currentCustomerDetailMatches('', manualHangupSnapshot.number)) {
+            const confirmed = await waitUntil(() => manualHangupConfirmedFor(manualHangupSnapshot), 300, 50);
+            if (confirmed) await syncCrmHangupAfterManualConfirm(log, manualHangupSnapshot);
           }
           // [v1.16.8] 页面已经在结束态（被拒/秒挂后 CRM 自己同步成"通话结束/已挂断"）——
           // 手机端显然已挂断：跳过整个挂断步骤，直接进"未接通"结果选择（用户明确要求）
@@ -2224,10 +2272,11 @@
             // 有 parentTab 时优先"就近等待"：等同面板的子选项真正渲染出来再点
             let appeared;
             if (step.parentTab) {
-              appeared = await waitForNearChild(step.text, step.parentTab, (step.waitTimeout || 5000) / 2, 30);
-              if (!appeared) appeared = await waitForText(step.text, (step.waitTimeout || 5000) / 2, 30);
+              const appearTimeout = fastFlow ? 700 : (step.waitTimeout || 5000) / 2;
+              appeared = await waitForNearChild(step.text, step.parentTab, appearTimeout, fastFlow ? 25 : 30);
+              if (!appeared) appeared = await waitForText(step.text, fastFlow ? 350 : (step.waitTimeout || 5000) / 2, fastFlow ? 25 : 30);
             } else {
-              appeared = await waitForText(step.text, step.waitTimeout || 5000, 30);
+              appeared = await waitForText(step.text, fastFlow ? 900 : (step.waitTimeout || 5000), fastFlow ? 25 : 30);
             }
             if (!appeared) { lastErr = '页面中没有出现「' + step.text + '」'; break; }
 
@@ -2245,16 +2294,16 @@
               let childAppeared;
               const parentKey = step.parentTab || step.text;
               if (step.parentTab || TOP_TABS.includes(step.text)) {
-                childAppeared = await waitForNearChild(step.afterText, parentKey, step.waitTimeout || 3000, 50);
-                if (!childAppeared) childAppeared = await waitForText(step.afterText, 1000, 50);
+                childAppeared = await waitForNearChild(step.afterText, parentKey, fastFlow ? 900 : (step.waitTimeout || 3000), fastFlow ? 25 : 50);
+                if (!childAppeared) childAppeared = await waitForText(step.afterText, fastFlow ? 400 : 1000, fastFlow ? 25 : 50);
               } else {
-                childAppeared = await waitForText(step.afterText, step.waitTimeout || 3000, 50);
+                childAppeared = await waitForText(step.afterText, fastFlow ? 900 : (step.waitTimeout || 3000), fastFlow ? 25 : 50);
               }
               if (!childAppeared) {
                 // 已选中也点不出来？可能子选项藏在"..."里，展开后再找一次
                 if (isElementSelected(target) || i > 0) {
                   await tryExpandMore(log, step.afterText);
-                  childAppeared = await waitForText(step.afterText, 2500, 50);
+                  childAppeared = await waitForText(step.afterText, fastFlow ? 900 : 2500, fastFlow ? 25 : 50);
                 }
               }
               if (childAppeared) {
@@ -2624,7 +2673,7 @@
   // 手机挂断联动中转（APK POST 事件 → 这里轮询）
   // [v1.15.0] 改走本机中转：relay-server 跑在这台电脑的 8787 端口，不再依赖云端额度。
   const RELAY_URL = 'http://127.0.0.1:8787/rest/call_events';
-  const RELAY_KEY = String(localStorage.getItem('yk_relay_access_key') || '');
+  const RELAY_KEY = 'wbpk_RuRaegc67Ryj6IVBy2ukTz_IPFe58thPnT5ck005el76XpxYEWA0P5l';
 
   // ---- 联动网络层：云客页面直连本机 8787 会被页面 CORS 拦掉 ----
   // 优先级：扩展后台桥（绕过跨域）→ 油猴 GM_xmlhttpRequest → 页面直连（兜底）
@@ -3318,7 +3367,7 @@
       panel.innerHTML = `
         <div class="yk-head">
           <div class="yk-logo">⚡</div>
-          <div class="yk-title">云客跟进助手<small>通话面板 <i>·</i> v1.24.0</small></div>
+          <div class="yk-title">云客跟进助手<small>通话面板 <i>·</i> v1.24.1</small></div>
           <button class="yk-iconbtn" id="yk_edit" title="自定义按钮布局">✎</button>
           <button class="yk-iconbtn" id="yk_close" title="关闭">✕</button>
         </div>

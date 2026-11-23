@@ -4,7 +4,7 @@
   // 页面真实 window（油猴沙盒模式下用 unsafeWindow，扩展 MAIN 世界即 window 本身）
   const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  const YK_BUILD = '1.24.1';
+  const YK_BUILD = '1.24.22';
   if (PW.__YK_CRM_HELPER__) {
     // 插件版和油猴版都跑在页面 MAIN world，谁先加载谁干活，后到的必须退出——
     // 以前这里是静默 return，于是"我改了怎么没生效"根本查不出是被另一份（旧版本）占了坑。
@@ -196,6 +196,25 @@
     const ce = clean(exact), cp = clean(partial);
     if (DEBUG) console.log('[跟进助手] 找「' + text + '」精确', ce.length, '个 / 模糊', cp.length, '个');
     return ce.length ? ce : cp;
+  }
+
+  // CRM 通话窗的提交按钮有稳定 ID。全页文本扫描在新版页面偶尔会被
+  // 包裹层/重复文本干扰，导致实际存在「提交」按钮却被误报为缺失。
+  function findSubmitButtons() {
+    const byId = document.querySelector('#callInCustomer');
+    if (byId && isVisible(byId) && !isDisabled(byId)) {
+      const button = getClickableAncestor(byId);
+      if (button && isVisible(button) && !isDisabled(button)) return [button];
+    }
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"], .ant-btn, .btn'))
+      .filter((el) => {
+        if (!isVisible(el) || isDisabled(el)) return false;
+        if (el.closest && el.closest('#yk_helper_panel, #yk_helper_fab, #yk_helper_toast')) return false;
+        const label = normalizeText(el.innerText || el.textContent);
+        return label === '提交' || (label.includes('提交') && label.length <= 8);
+      });
+    if (candidates.length) return candidates;
+    return findClickablesByText('提交').map(getClickableAncestor).filter((el) => el && isVisible(el) && !isDisabled(el));
   }
 
   function hasVisibleText(text) { return findClickablesByText(text).length > 0; }
@@ -435,12 +454,25 @@
   // 手机号在该详情区精确一致时，当前页本身就是已确认的客户上下文。
   // CRM 名称可能是别名/重复档案名，号码精确一致优先于姓名差异。
   function currentCustomerDetailMatches(name, phone) {
-    const expected = String(phone || '').replace(/\D/g, '');
-    if (expected.length < 7) return false;
-    const variants = new Set([expected]);
-    if (expected.startsWith('86') && expected.length === 13) variants.add(expected.slice(2));
+    const rawExpected = String(phone || '').replace(/\D/g, '');
+    if (rawExpected.length < 7) return false;
+    const variants = new Set([rawExpected]);
+    if (rawExpected.startsWith('0086') && rawExpected.length > 11) variants.add(rawExpected.slice(4));
+    if (rawExpected.startsWith('86') && rawExpected.length > 11) variants.add(rawExpected.slice(2));
     const areaLimit = window.innerWidth * window.innerHeight * 0.65;
-    const anchors = findClickablesByText('客户详情').concat(findClickablesByText('手机号'));
+    // 不依赖 findClickablesByText：云客抽屉里的“手机号”是静态描述项，
+    // 页面升级后常被结构过滤器当成非控件排除。直接找短的字段标签文本节点。
+    const labelAnchors = [];
+    try {
+      for (const el of document.querySelectorAll('label,dt,dd,span,div,td,p,strong')) {
+        if (el.childElementCount > 2) continue;
+        const ownText = Array.from(el.childNodes || [])
+          .filter((node) => node.nodeType === Node.TEXT_NODE)
+          .map((node) => normalizeText(node.textContent || '')).join('');
+        if (/^(手机号|联系电话|联系电话号码|手机号码)[:：]?$/.test(ownText)) labelAnchors.push(el);
+      }
+    } catch (e) {}
+    const anchors = labelAnchors.concat(findClickablesByText('客户详情'), findClickablesByText('手机号'));
     const seen = new Set();
     for (const anchor of anchors) {
       for (let cur = anchor, depth = 0; cur && depth < 8; cur = cur.parentElement, depth++) {
@@ -451,11 +483,113 @@
         const text = normalizeText(cur.innerText || cur.textContent || '');
         if (!text.includes('客户详情') && !text.includes('手机号')) continue;
         const shown = text.match(/\d{7,15}/g) || [];
-        if (!shown.some((n) => variants.has(n))) continue;
-        return true;
+        if (shown.some((n) => variants.has(n))) return true;
+        // 云客详情会将手机号显示成 136****0890；要求区号前缀与末四位同时吻合，
+        // 避免只凭尾号把另一位客户认成当前客户。
+        const maskedPhones = text.match(/\d{2,4}\*{2,}\d{3,4}/g) || [];
+        const maskedNumberMatches = maskedPhones.some((masked) => {
+          const parts = masked.split('*');
+          const prefix = parts[0] || '', suffix = parts[parts.length - 1] || '';
+          // 同时核对本地号码与 +86 号码变体；掩码至少需暴露前三位和末四位。
+          return prefix.length >= 3 && suffix.length >= 4 && Array.from(variants).some((candidate) => {
+            // 对带国家码的上报号同时尝试标准 11 位本地号。
+            const local = candidate.startsWith('0086') ? candidate.slice(4)
+              : candidate.startsWith('86') && candidate.length > 11 ? candidate.slice(2) : candidate;
+            return local.startsWith(prefix) && local.endsWith(suffix);
+          });
+        });
+        if (maskedNumberMatches) return true;
       }
     }
     return false;
+  }
+
+  // 回拨/中间号线路下，APK 上报的号码可能与 CRM 客户号码不同。
+  // 拨号状态刚出现时额外抓取当前详情中的姓名和显示号码（可为脱敏号），供本通事件关联。
+  function findVisibleCustomerDetailRoot() {
+    let best = null, bestArea = Infinity;
+    try {
+      for (const el of document.querySelectorAll('h1,h2,h3,h4,label,span,div,strong')) {
+        if (el.childElementCount > 2) continue;
+        const own = Array.from(el.childNodes || []).filter((n) => n.nodeType === Node.TEXT_NODE)
+          .map((n) => normalizeText(n.textContent || '')).join('');
+        if (!own.includes('客户详情') || !isVisible(el)) continue;
+        for (let root = el, depth = 0; root && depth < 9; root = root.parentElement, depth++) {
+          if (!isVisible(root)) continue;
+          const area = elArea(root);
+          if (!area || area > window.innerWidth * window.innerHeight * 0.75 || area >= bestArea) continue;
+          const text = normalizeText(root.innerText || root.textContent || '');
+          if (text.includes('客户详情') && text.includes('姓名') && text.includes('手机号')) {
+            best = root; bestArea = area;
+          }
+        }
+      }
+    } catch (e) {}
+    return best;
+  }
+
+  function readCrmDetailField(field, type, root) {
+    const labels = [];
+    try {
+      for (const el of (root || document).querySelectorAll('label,dt,dd,span,div,td,p,strong')) {
+        if (el.childElementCount > 2) continue;
+        const own = Array.from(el.childNodes || []).filter((n) => n.nodeType === Node.TEXT_NODE)
+          .map((n) => normalizeText(n.textContent || '')).join('');
+        if (own === field) labels.push(el);
+      }
+    } catch (e) {}
+    const valid = (text) => {
+      const value = normalizeText(text || '');
+      if (!value || value.length > 24) return '';
+      if (type === 'phone') {
+        const full = value.match(/1[3-9]\d{9}/);
+        if (full) return full[0];
+        const masked = value.match(/1[3-9]\d{1,2}\*{2,}\d{3,4}/);
+        return masked ? masked[0] : '';
+      }
+      if (/\d/.test(value) || !/[\u4e00-\u9fa5A-Za-z]/.test(value) || value.length < 2) return '';
+      if (/姓名|手机号|客户详情|编辑客户|号码归属|联系电话|电话沟通|跟进信息|个人信息|企业信息|时间轴/.test(value)) return '';
+      return value;
+    };
+    for (const label of labels) {
+      if (!isVisible(label)) continue;
+      let owner = label;
+      for (let depth = 0; owner && owner.parentElement && depth < 5; depth++) {
+        const parent = owner.parentElement;
+        const area = elArea(parent);
+        if (area > window.innerWidth * window.innerHeight * 0.12) { owner = parent; continue; }
+        for (const sibling of Array.from(parent.children || [])) {
+          if (sibling === owner || sibling.contains(owner) || !isVisible(sibling)) continue;
+          const nodes = [sibling].concat(Array.from(sibling.querySelectorAll('span,div,label,td,dd,p,strong')));
+          for (const node of nodes) {
+            if (node.childElementCount > 2 || !isVisible(node)) continue;
+            const found = valid(node.innerText || node.textContent || '');
+            if (found) return found;
+          }
+        }
+        owner = parent;
+      }
+    }
+    return '';
+  }
+
+  function readCrmDetailIdentity() {
+    const root = findVisibleCustomerDetailRoot();
+    if (!root) return { name: '', phone: '' };
+    return { name: readCrmDetailField('姓名', 'name', root), phone: readCrmDetailField('手机号', 'phone', root) };
+  }
+
+  function currentCustomerDetailMatchesCapture(name, capturedPhone) {
+    const wantedName = normalizeText(name || '');
+    const wantedPhone = normalizeText(capturedPhone || '').replace(/[^\d*]/g, '');
+    if (!wantedName || !wantedPhone) return false;
+    const current = readCrmDetailIdentity();
+    if (!current.name || normalizeText(current.name) !== wantedName || !current.phone) return false;
+    const shown = normalizeText(current.phone).replace(/[^\d*]/g, '');
+    if (shown === wantedPhone) return true;
+    const masked = (wantedPhone.match(/^(\d{3,4})\*{2,}(\d{3,4})$/) || current.phone.match(/^(\d{3,4})\*{2,}(\d{3,4})$/));
+    const full = /^1[3-9]\d{9}$/.test(wantedPhone) ? wantedPhone : /^1[3-9]\d{9}$/.test(shown) ? shown : '';
+    return !!(masked && full && full.startsWith(masked[1]) && full.endsWith(masked[2]));
   }
 
   // 页签太多时后面的被折进 "..." （ant-tabs-nav-more），展开一次再找
@@ -479,14 +613,19 @@
     return false;
   }
 
-  async function switchToCallTab(name, phone) {
+  async function switchToCallTab(name, phone, capturedCrmPhone) {
     try {
       if (currentCustomerDetailMatches(name, phone)) {
         ykStatusUpdate({ match: '✅ 右侧详情手机号一致', crmCustomer: name || String(phone || '') });
         try { if (typeof PW.__YK_STATUS_REFRESH_IDENTITY__ === 'function') PW.__YK_STATUS_REFRESH_IDENTITY__(true); } catch (e) {}
         return '当前客户详情';
       }
-      const keys = callTabKeys(name, phone);
+      if (currentCustomerDetailMatchesCapture(name, capturedCrmPhone)) {
+        ykStatusUpdate({ match: '✅ 当前客户与拨出时快照一致', crmCustomer: name || '' });
+        try { if (typeof PW.__YK_STATUS_REFRESH_IDENTITY__ === 'function') PW.__YK_STATUS_REFRESH_IDENTITY__(true); } catch (e) {}
+        return '当前客户详情（拨出快照）';
+      }
+      const keys = callTabKeys(name, capturedCrmPhone || phone);
       if (!keys.length) {
         ykStatusUpdate({ match: '⚠ 手机状态缺少可核对的姓名或号码' });
         return null;
@@ -729,7 +868,8 @@
       hotkey: 'F',
       color: '#dc2626',
       steps: [
-        { act: 'hangup' },
+        // 未接通由电脑直接同步挂断云客页面，不等待 APK 回执，也不再给手机补发挂断指令。
+        { act: 'hangup', desktopNoAnswer: true },
         { act: 'expandMore', ensureText: '未接通' },
         { act: 'click', text: '未接通', afterText: '无人接听', retryCount: 2 },
         { act: 'click', text: '无人接听', parentTab: '未接通', retryCount: 2 },
@@ -747,6 +887,8 @@
         { act: 'expandMore', ensureText: '无意向' },
         { act: 'click', text: '无意向', afterText: '拒绝', retryCount: 2 },
         { act: 'click', text: '拒绝', parentTab: '无意向', retryCount: 2 },
+        // D 流程的销售进度固定选择「无效客户」，再提交跟进记录。
+        { act: 'click', text: '无效客户', retryCount: 2 },
         { act: 'submit' },
       ],
     },
@@ -1235,6 +1377,26 @@
     const age = Date.now() - evAt;
     // CRM 页签对齐可能耗时数秒；上游只把 8 秒内的新事件交给流程，因此这里放宽处理窗口。
     return age >= -5000 && age <= 45000 && !phoneMovedOn(evAt);
+  }
+
+  // 手机刚结束一通，但客户页签身份暂时无法唯一确认时，也要把“当前已打开的 CRM 活动通话”同步结束。
+  // 仅限很新的 APK 挂断事件、当前确有通话详情及挂断按钮、手机没有进入下一通；跟进仍进入待补录，避免误写客户。
+  async function syncVisibleCrmHangupForFreshPhoneEvent(evAt) {
+    const age = Date.now() - Number(evAt || 0);
+    if (!Number.isFinite(age) || age < -1500 || age > 8000) return false;
+    if (phoneMovedOn(evAt)) return false;
+    const activeCall = hasVisibleText('通话中') || hasVisibleText('拨打中');
+    const detailOpen = hasVisibleText('客户详情') && hasVisibleText('手机号');
+    if (!activeCall || !detailOpen) return false;
+    const buttons = findClickablesByText(...HANGUP_TEXTS).filter((el) =>
+      !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent))
+    );
+    const button = buttons.find((el) => getClickableAncestor(el).tagName === 'BUTTON') || buttons[0];
+    if (!button || !realClick(getClickableAncestor(button))) return false;
+    lastCrmHangupSyncAt = Date.now();
+    await waitUntil(() => hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') ||
+      hasVisibleText('呼叫结束') || (findClickablesByText(...HANGUP_TEXTS).length === 0 && !hasVisibleText('通话中')), 3500, 80);
+    return true;
   }
 
   // [v1.16.2]/[v1.18.2] 号码校正表 + 每通电话的客户身份快照（键：手机上报的原号 & 换算出的真实号各存一份）
@@ -1888,7 +2050,7 @@
     const autoFlow = !!(opts && (opts.gentleHangup || opts.pageSelfEnded || opts.matchPhone || opts.evAt));
     if (autoFlow) {
       if (!phoneCallEndedFresh()) { log.push('手机未新鲜上报通话结束，扩展不点 CRM 挂断控件'); return false; }
-      if (newCallDialing()) { log.push('⚠ 想补挂同步，但检测到新通话在拨，放弃'); return false; }
+      if (newCallDialing() && !phoneHangupEventFresh(opts)) { log.push('⚠ 想补挂同步，但检测到新通话在拨，放弃'); return false; }
       // [v1.18.9] 手机已拨出更新的电话时绝不补点（补点掐掉的会是新一通）
       if (opts.evAt && phoneMovedOn(opts.evAt)) {
         log.push('⚠ 想补挂同步，但手机已拨出更新的电话（' + ((PW.__ykPhRow || {}).state || '') + '），放弃');
@@ -1901,7 +2063,9 @@
       }
       // [v1.18.4] 计时在往前走 = 真人通话，不点；冻结不动（残影）才允许点
       const live1 = readLiveCallTimer();
-      if (live1 !== null) {
+      // 新鲜 APK 挂断事件已经确认本通结束；再等待 1 秒采样网页计时器只会拖慢 CRM 同步。
+      // 仍保留 phoneMovedOn/newCallDialing 两道新通保护，旧/不明确事件继续双采样。
+      if (live1 !== null && !phoneHangupEventFresh(opts)) {
         await sleep(1000);
         const live2 = readLiveCallTimer();
         if (live2 !== null && live2 > live1) {
@@ -1927,6 +2091,94 @@
 
   // CRM 页面同步按钮点击时间：用于识别同一次挂断回报，避免重复点击页面。
   let lastCrmHangupSyncAt = 0;
+  let manualHangupCrmSyncJob = null;
+  let manualHangupCrmSyncBusy = false;
+
+  function clearManualHangupCrmSyncJob(job) {
+    if (job && manualHangupCrmSyncJob && manualHangupCrmSyncJob.at !== job.at) return;
+    manualHangupCrmSyncJob = null;
+    if (PW.__YK_MANUAL_FLOW_HANGUP__ && PW.__YK_MANUAL_FLOW_HANGUP__.crmSyncPending) PW.__YK_MANUAL_FLOW_HANGUP__ = null;
+    try { localStorage.removeItem('yk_manual_flow_hangup_v1'); } catch (e) {}
+  }
+
+  // 手动流程里手机挂断回执可能晚于结果按钮流程。回执本身确认线路已结束，
+  // 所以先等当前表单操作完成，再对已核对的同一客户页补点 CRM 挂断控件。
+  function processManualHangupCrmSync() {
+    if (!manualHangupCrmSyncJob) {
+      try {
+        const saved = JSON.parse(localStorage.getItem('yk_manual_flow_hangup_v1') || 'null');
+        if (saved && saved.crmSyncPending) manualHangupCrmSyncJob = saved;
+      } catch (e) {}
+    }
+    const job = manualHangupCrmSyncJob;
+    if (!job || running || manualHangupCrmSyncBusy) return;
+    const eventAt = Number(job.eventAt) || 0;
+    if (!eventAt || Date.now() - eventAt > 45000) { clearManualHangupCrmSyncJob(job); return; }
+    if (newCallDialing() || phoneMovedOn(eventAt)) {
+      clearManualHangupCrmSyncJob(job);
+      ykStatusUpdate({ progress: '手机已进入下一通', outcome: '已取消上一通的 CRM 挂断点击，避免误挂新通' });
+      return;
+    }
+    if (!currentCustomerDetailMatches(String(job.name || ''), String(job.number || ''))) return;
+    if (hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束')) {
+      clearManualHangupCrmSyncJob(job);
+      return;
+    }
+    if (job.crmClickAt && Date.now() - Number(job.crmClickAt) < 5000) return;
+    manualHangupCrmSyncBusy = true;
+    try {
+      for (const label of HANGUP_TEXTS) {
+        const all = findClickablesByText(label).filter((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent)));
+        const btn = all.find((el) => getClickableAncestor(el).tagName === 'BUTTON') || all[0] || null;
+        if (!btn) continue;
+        const target = getClickableAncestor(btn);
+        if (!realClick(target)) break;
+        job.crmClickAt = Date.now();
+        lastCrmHangupSyncAt = job.crmClickAt;
+        if (PW.__YK_MANUAL_FLOW_HANGUP__ && PW.__YK_MANUAL_FLOW_HANGUP__.at === job.at) {
+          PW.__YK_MANUAL_FLOW_HANGUP__.crmClickAt = job.crmClickAt;
+        }
+        try { localStorage.setItem('yk_manual_flow_hangup_v1', JSON.stringify(job)); } catch (e) {}
+        ykStatusUpdate({ progress: '手机已确认挂断', outcome: '正在同步 CRM 页面挂断' });
+        toast('📵 手机已挂断，正在同步云客通话页面', false, true);
+        clearManualHangupCrmSyncJob(job); // 页面点击已发出，不重复点击或重复提交跟进
+        break;
+      }
+    } finally { manualHangupCrmSyncBusy = false; }
+  }
+
+  // 手动结果流程先请求手机挂断。若手机随后回执了同一通已结束，趁结果表单提交前
+  // 先把 CRM 页面状态同步好，避免先提交被“请挂断电话”拦截、再同步、再提交的往返。
+  function manualHangupConfirmedFor(snapshot) {
+    if (!snapshot || !phoneCallEndedFresh() || newCallDialing()) return false;
+    const ph = PW.__ykPhRow || {};
+    const currentNumber = String(ph.number || '').replace(/\D/g, '');
+    const sameNumber = !snapshot.number || !currentNumber || currentNumber === snapshot.number;
+    const transitioned = Number(ph.stateAt || 0) > Number(snapshot.stateAt || 0) ||
+      String(ph.state || '').toLowerCase() !== String(snapshot.state || '').toLowerCase();
+    return sameNumber && transitioned;
+  }
+  async function syncCrmHangupAfterManualConfirm(log, snapshot) {
+    if (!manualHangupConfirmedFor(snapshot)) return false;
+    if (hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束')) {
+      return true;
+    }
+    for (const label of HANGUP_TEXTS) {
+      const all = findClickablesByText(label).filter((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent)));
+      const btn = all.find((el) => getClickableAncestor(el).tagName === 'BUTTON') || all[0] || null;
+      if (!btn) continue;
+      if (!realClick(getClickableAncestor(btn))) return false;
+      lastCrmHangupSyncAt = Date.now();
+      log.push('手机已确认本通挂断，提前同步 CRM 页面状态');
+      const ended = await waitUntil(() =>
+        hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束') ||
+        (findClickablesByText('挂断').length === 0 && !hasVisibleText('通话中')), 900, 60
+      );
+      if (ended) log.push('CRM 挂断状态已同步，直接提交一次');
+      return ended;
+    }
+    return false;
+  }
 
   // 手动结果流程先请求手机挂断。若手机随后回执了同一通已结束，趁结果表单提交前
   // 先把 CRM 页面状态同步好，避免先提交被“请挂断电话”拦截、再同步、再提交的往返。
@@ -2005,7 +2257,8 @@
           throw new Error(blockMessage);
         }
         const phaseStartedAt = Date.now();
-        const phaseName = step.act === 'click' ? '选择「' + step.text + '」'
+        const phaseName = step.desktopNoAnswer ? '电脑挂断未接通电话'
+          : step.act === 'click' ? '选择「' + step.text + '」'
           : step.act === 'submit' ? 'CRM提交'
             : step.act === 'expandMore' ? '展开结果'
             : step.act === 'hangup' ? '挂断同步' : step.act;
@@ -2016,8 +2269,10 @@
           // 云客连续拨打在上一通结束后几秒内就自动拨下一通，此时页面上的"通话中"
           // 是新电话的——流程绝不能点挂断，否则每轮流程都会掐死下一通，队列被烧光。
           const autoTrigger = !!(opts && (opts.gentleHangup || opts.pageSelfEnded || opts.matchPhone));
+          const phoneStateForHangup = String((PW.__ykPhRow || {}).state || '').toLowerCase();
+          const desktopNoAnswer = !!step.desktopNoAnswer || /^(dialing|ringing)$/.test(phoneStateForHangup);
           const crmAlreadyEnded = hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束');
-          if (!autoTrigger && !phoneCallEndedFresh() && !crmAlreadyEnded) {
+          if (!autoTrigger && !phoneCallEndedFresh() && !crmAlreadyEnded && !desktopNoAnswer) {
             if (typeof PW.__YK_MANUAL_PHONE_ACTIVE__ === 'function' && PW.__YK_MANUAL_PHONE_ACTIVE__()) {
               const commandAt = Date.now();
               const mobileBeforeHangup = PW.__ykPhRow || {};
@@ -2026,7 +2281,13 @@
                 stateAt: Number(mobileBeforeHangup.stateAt) || 0,
                 number: String(mobileBeforeHangup.number || '').replace(/\D/g, ''),
               };
-              const manualFlowMarker = { at: commandAt, number: String(mobileBeforeHangup.number || '') };
+              const manualFlowMarker = {
+                at: commandAt,
+                number: String(mobileBeforeHangup.number || ''),
+                name: String(mobileBeforeHangup.name || ''),
+                state: String(mobileBeforeHangup.state || '').toLowerCase(),
+                stateAt: Number(mobileBeforeHangup.stateAt) || 0,
+              };
               PW.__YK_MANUAL_FLOW_HANGUP__ = manualFlowMarker;
               try { localStorage.setItem('yk_manual_flow_hangup_v1', JSON.stringify(manualFlowMarker)); } catch (e) {}
               ykStatusUpdate({ progress: '正在请求手机 APK 挂断', outcome: '不等待状态表刷新，继续填写跟进' });
@@ -2046,13 +2307,22 @@
               log.push('手机状态未连接或已过期；按你选定的结果继续填写，跳过 CRM 挂断控件');
             }
           }
+          if (desktopNoAnswer) {
+            log.push('未接通流程改由电脑直接点击云客挂断；跳过手机 APK 请求和手机状态等待');
+            ykStatusUpdate({ progress: '电脑正在挂断未接通电话', outcome: '不等待手机 APK 确认' });
+          }
           // [v1.19.7] 联动/自动触发的挂断点击只是"把页面推到结束态"，绝不回头给手机下指令：
           // 手机这通本来就是它自己挂的，指令 0.2 秒后被取到时 CRM 常常已拨出下一通，掐掉的正是新一通。
           // [v1.17.8] 未接通不再"一律不点页面挂断"：那样页面会一直卡在通话中，CRM 直接拦住不让提交
           // （用户实测：手机挂了、电脑没跟着挂，跟进提交不了）。现在照样补点同步，
           // 但必须过下面两道闸门；万一被闸门挡住，提交步骤还有一层"请挂断电话"兜底。
           // 手动按键是用户看着屏幕主动结束这通，不在此列。
-          const needGuard = autoTrigger || !!(opts && opts.noAnswer);
+          const needGuard = (autoTrigger || !!(opts && opts.noAnswer)) && !desktopNoAnswer;
+          if (desktopNoAnswer && autoTrigger && ((opts && opts.evAt && phoneMovedOn(opts.evAt)) ||
+              (newCallDialing() && !phoneHangupEventFresh(opts)))) {
+            log.push('检测到手机已进入下一通，取消旧的未接通挂断，避免误挂新通');
+            continue;
+          }
           if (opts && opts.pageSelfEnded) {
             // 触发时页面已确认自行结束通话（自动模式的通话结束监听观察到的）
             log.push('页面已自行结束通话，跳过点挂断');
@@ -2079,7 +2349,9 @@
             }
             // [v1.17.5] 两道闸门从"仅 gentleHangup"里提出来：之前用 { pageSelfEnded } 之外的
             // 自动路径（如自动模式倒计时）触发时完全不设防，照样能点掉正在拨的下一通。
-            if (newCallDialing()) {
+            // 20 秒内的页面计时可能只是本通刚结束留下的残影；新鲜 APK 结束回执已确定本通结束，
+            // 下一通只由手机状态时间线 phoneMovedOn 判断，不能再被 CRM 短计时误拦。
+            if (newCallDialing() && !phoneHangupEventFresh(opts)) {
               log.push('检测到新通话在拨，跳过点挂断');
               continue;
             }
@@ -2091,7 +2363,9 @@
             const live1 = readLiveCallTimer();
             // [v1.18.4] 阈值从 20 秒降到「只要计时在走」：刚接通十几秒也是真人通话，
             // 老阈值让这段时间完全不设防，自动路径会点掉 CRM 刚拨出去的新电话。
-            if (live1 !== null) {
+            // 新鲜的手机挂断回执已确认本通结束；避免固定多等 1 秒。
+            // phoneMovedOn 与 newCallDialing 已在上方检查，旧事件仍走双采样保护。
+            if (live1 !== null && !phoneHangupEventFresh(opts)) {
               await sleep(1000);
               const live2 = readLiveCallTimer();
               if (live2 !== null && live2 > live1) {
@@ -2124,12 +2398,22 @@
           // [v1.19.7→v1.22.9] 手动挂断与 CRM 客户匹配分离：先保存身份核对结果，继续执行手机挂断；
           // 若无法唯一匹配，只在下一步 CRM 跟进填写/提交前暂停，绝不把跟进写到错误客户。
           if (!autoTrigger) {
-            const alignment = await alignToLivePhoneCall(log);
-            if (alignment.active && !alignment.aligned) {
-              manualCrmFollowupBlocked = true;
-              const message = '手机通话客户无法唯一匹配 CRM 页面；继续处理手动挂断，后续跟进录入暂停';
-              log.push(message);
-              ykStatusUpdate({ progress: '手动挂断继续 · CRM 跟进暂停', outcome: '客户页未唯一匹配' });
+            const hasVisibleHangup = HANGUP_TEXTS.some((label) => findClickablesByText(label)
+              .some((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent))));
+            const currentCrmCallContext = (hasVisibleText('通话中') || hasVisibleHangup) &&
+              hasVisibleText('客户详情') && hasVisibleText('手机号');
+            if (currentCrmCallContext) {
+              // 用户从当前打开的 CRM 客户通话详情手动选 D 等结果时，该页面就是明确上下文；
+              // 不因手机号码掩码/回拨号码差异阻断本页跟进，避免“电脑已挂断但没有跟进”。
+              log.push('当前 CRM 客户详情和通话页已打开，按用户当前页面继续填写跟进');
+            } else {
+              const alignment = await alignToLivePhoneCall(log);
+              if (alignment.active && !alignment.aligned) {
+                manualCrmFollowupBlocked = true;
+                const message = '手机通话客户无法唯一匹配 CRM 页面；继续处理手动挂断，后续跟进录入暂停';
+                log.push(message);
+                ykStatusUpdate({ progress: '手动挂断继续 · CRM 跟进暂停', outcome: '客户页未唯一匹配' });
+              }
             }
           }
           // 手机状态轮询与结果按钮点击并行。最多额外等 300ms 捕获刚到的本通挂断回执；
@@ -2145,7 +2429,7 @@
           if (hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') || hasVisibleText('呼叫结束')) {
             log.push('页面已挂断，跳过挂断步骤，直接选未接通');
           } else {
-          if (!phoneCallEndedFresh() && !phoneHangupEventFresh(opts)) {
+          if (!phoneCallEndedFresh() && !phoneHangupEventFresh(opts) && !desktopNoAnswer) {
             if (!autoTrigger) {
               log.push('手动结果流程不等待手机确认；跳过 CRM 挂断控件，继续填写跟进');
               ykStatusUpdate({ progress: '继续填写已选跟进结果', outcome: '跳过等待手机状态确认' });
@@ -2183,7 +2467,7 @@
               hasVisibleText('已结束') ||
               hasVisibleText('呼叫结束') ||
               (findClickablesByText('挂断').length === 0 && !hasVisibleText('通话中')),
-              15000, 80
+              desktopNoAnswer ? 3500 : 15000, 80
             );
             // [v1.14.6] 超时不再报错弹窗（用户反馈吓人）：手机端早已挂断，这里只是页面同步问题，
             // 静默记录后继续走选结果流程；若 CRM 真的没挂断，后续提交会被"请挂断电话"校验拦下并提示
@@ -2216,7 +2500,7 @@
                 await waitUntil(() =>
                   hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') ||
                   hasVisibleText('呼叫结束') ||
-                  (findClickablesByText('挂断').length === 0 && !hasVisibleText('通话中')), 8000, 80);
+                (findClickablesByText('挂断').length === 0 && !hasVisibleText('通话中')), desktopNoAnswer ? 3500 : 8000, 80);
               }
             }
             if (!hb2) {
@@ -2412,7 +2696,7 @@
           await runPublicFilter(log);
 
         } else if (step.act === 'submit') {
-          const els = findClickablesByText('提交');
+          const els = findSubmitButtons();
           if (els.length) {
             const submitBtn = getClickableAncestor(pickSmallest(els));
             if (!realClick(submitBtn)) throw new Error('提交按钮点击失败');
@@ -2427,7 +2711,7 @@
             let currentSubmitButtons = [];
             let validationBlocked = false;
             const settled = await waitUntil(() => {
-              currentSubmitButtons = findClickablesByText('提交');
+              currentSubmitButtons = findSubmitButtons();
               validationBlocked = hasVisibleText('不可为空') || hasVisibleText('提交失败');
               return currentSubmitButtons.length === 0 || validationBlocked;
             }, 900, 60);
@@ -2440,13 +2724,13 @@
             const blockedByCall = hasVisibleText('请挂断电话') || hasVisibleText('请先挂断') ||
               (currentSubmitButtons.includes(submitBtn) && hasVisibleText('通话中'));
             if (blockedByCall && await staleHangupSync(log, opts)) {
-              const els2 = findClickablesByText('提交');
+              const els2 = findSubmitButtons();
               if (els2.length) {
                 realClick(getClickableAncestor(pickSmallest(els2)));
                 submitOutcome = 'pending';
                 log.push('重新提交');
                 const retrySettled = await waitUntil(() => {
-                  currentSubmitButtons = findClickablesByText('提交');
+                  currentSubmitButtons = findSubmitButtons();
                   validationBlocked = hasVisibleText('不可为空') || hasVisibleText('提交失败');
                   return currentSubmitButtons.length === 0 || validationBlocked;
                 }, 1200, 60);
@@ -2460,7 +2744,7 @@
               log.push('⚠ CRM拦截：有必填项没选上');
             }
             // [v1.14.6] 按用户要求去掉"补点一次"：不再二次点击提交，只静默记录
-            const still = findClickablesByText('提交');
+            const still = findSubmitButtons();
             if (still.length && still.includes(submitBtn)) {
               if (submitOutcome !== 'blocked') submitOutcome = 'unconfirmed';
               log.push('提交按钮仍在（不补点）');
@@ -2664,11 +2948,30 @@
     return s.length === 1 ? s.toUpperCase() : s;
   }
 
+  function keyCodeDisplay(code) {
+    const s = String(code || '');
+    if (/^Key[A-Z]$/.test(s)) return s.slice(3);
+    if (/^Digit\d$/.test(s)) return s.slice(5);
+    if (/^Numpad\d$/.test(s)) return 'Num ' + s.slice(6);
+    const names = { Space: 'Space', Enter: 'Enter', Escape: 'Esc', Backspace: 'Backspace', Tab: 'Tab',
+      ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→', PageUp: 'PageUp', PageDown: 'PageDown' };
+    return names[s] || keyDisplay(s);
+  }
+
+  function keyCodeSemantic(code) {
+    const s = String(code || '');
+    if (/^Key[A-Z]$/.test(s)) return s.slice(3).toLowerCase();
+    if (/^Digit\d$/.test(s)) return s.slice(5);
+    if (/^Numpad\d$/.test(s)) return s.slice(6);
+    if (s === 'Space') return ' ';
+    return s.toLowerCase();
+  }
+
   // ============================================================
   // 自动模式设置与关键词识别
   // ============================================================
   const AUTO_KEY = 'yk_auto_settings_v1';
-  const AUTO_DEFAULTS = { autoMode: true, autoSeconds: 0, useKeywords: false, lastFlow: 'F', linkFlow: 'D', execKey: 'Enter', noAnsOn: false, noAnsSec: 15, focusOnLink: false, connectNotice: true };
+  const AUTO_DEFAULTS = { autoMode: true, autoSeconds: 0, useKeywords: false, lastFlow: 'F', linkFlow: 'D', execKey: 'Enter', bulkDialKey: 'F9', noAnsOn: false, noAnsSec: 15, focusOnLink: false, connectNotice: true };
 
   // 手机挂断联动中转（APK POST 事件 → 这里轮询）
   // [v1.15.0] 改走本机中转：relay-server 跑在这台电脑的 8787 端口，不再依赖云端额度。
@@ -3034,6 +3337,18 @@
       #yk_eff_line:hover { color: #fbbf24; }
 
       .yk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+      .yk-bulk-dial {
+        flex: 1; min-width: 0; margin: 0; padding: 11px 14px; border: 1px solid rgba(96,165,250,.55);
+        border-radius: 11px; color: #fff; font-family: inherit; font-size: 13px; font-weight: 700; line-height: 1.25; cursor: pointer;
+        background: linear-gradient(120deg, #2563eb, #0ea5e9); box-shadow: 0 8px 18px -10px rgba(37,99,235,.85);
+        transition: transform .15s, filter .15s, box-shadow .15s;
+      }
+      .yk-bulk-dial:hover { transform: translateY(-1px); filter: brightness(1.08); box-shadow: 0 10px 22px -10px rgba(14,165,233,.9); }
+      .yk-bulk-dial:disabled { opacity: .65; cursor: wait; transform: none; }
+      .yk-bulk-dial small { display: block; margin-top: 3px; color: rgba(239,246,255,.82); font-size: 10px; font-weight: 500; }
+      .yk-bulk-dial-wrap { display: flex; align-items: stretch; gap: 7px; margin: 0 0 10px; }
+      .yk-bulk-dial-key { min-width: 42px; padding: 0 9px; border: 1px solid rgba(96,165,250,.3); border-radius: 10px; background: rgba(37,99,235,.12); color: #bfdbfe; font-family: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
+      .yk-bulk-dial-key.listening { color: #fff; border-color: #60a5fa; background: #2563eb; animation: ykblink 1s infinite; }
       .yk-card {
         display: flex; align-items: center; gap: 7px; padding: 10px 10px 10px 13px;
         border: 1px solid rgba(148,163,184,.12); border-radius: 13px;
@@ -3367,7 +3682,7 @@
       panel.innerHTML = `
         <div class="yk-head">
           <div class="yk-logo">⚡</div>
-          <div class="yk-title">云客跟进助手<small>通话面板 <i>·</i> v1.24.1</small></div>
+          <div class="yk-title">云客跟进助手<small>通话面板 <i>·</i> v1.24.13</small></div>
           <button class="yk-iconbtn" id="yk_edit" title="自定义按钮布局">✎</button>
           <button class="yk-iconbtn" id="yk_close" title="关闭">✕</button>
         </div>
@@ -3375,7 +3690,7 @@
         <div id="yk_call_status"><span id="yk_call_dot">⚪ 暂无通话</span><span id="yk_call_timer"></span></div>
         <section id="yk_manual_call_card" aria-live="polite">
           <div id="yk_manual_hangup_status">正在等待手机状态…</div>
-          <button id="yk_manual_hangup" type="button" title="由手机 APK 执行挂断" aria-label="挂断当前手机通话" disabled><span class="yk-hangup-icon">■</span><span>挂断手机</span><span class="yk-hangup-arrow">↗</span></button>
+          <button id="yk_manual_hangup" type="button" title="由手机 APK 执行挂断" aria-label="挂断当前手机通话" disabled><span class="yk-hangup-icon">■</span><span class="yk-hangup-label">挂断手机</span><span class="yk-hangup-arrow">↗</span></button>
         </section>
         <div class="yk-progress-line" aria-live="polite"><span id="yk_status_progress">待命</span><span id="yk_status_outcome">—</span></div>
         <details class="yk-details" id="yk_status_details">
@@ -3389,6 +3704,10 @@
           </div>
         </details>
         <div id="yk_eff_line" onclick="window.__ykEffClick && window.__ykEffClick()" title="点击清除已到时的重拨提醒"></div>
+        <div class="yk-bulk-dial-wrap">
+          <button class="yk-bulk-dial" id="yk_bulk_dial" type="button">500条/页 · 全选并拨打<small>先切到每页500条，等列表加载后全选并启动连续外呼</small></button>
+          <button class="yk-bulk-dial-key" id="yk_bulk_dial_key" type="button" title="点击后按任意键设置全选拨打快捷键">F9</button>
+        </div>
         <div class="yk-section-head yk-results-head"><span>跟进结果</span></div>
         <div class="yk-grid" id="yk_grid"></div>
         <details class="yk-details" id="yk_tools_details">
@@ -3443,6 +3762,130 @@
       const foot = panel.querySelector('#yk_foot');
       const editBtn = panel.querySelector('#yk_edit');
       const toolsDetails = panel.querySelector('#yk_tools_details');
+      const bulkDialButton = panel.querySelector('#yk_bulk_dial');
+      const bulkDialKeyButton = panel.querySelector('#yk_bulk_dial_key');
+      const renderBulkDialKey = () => { if (bulkDialKeyButton) bulkDialKeyButton.textContent = keyCodeDisplay(loadAuto().bulkDialKey || 'F9'); };
+      renderBulkDialKey();
+      if (bulkDialKeyButton) bulkDialKeyButton.addEventListener('click', () => {
+        capturingBulkDialKey = true;
+        bulkDialKeyButton.classList.add('listening');
+        toast('⚙ 请按下“全选并开始拨打”要用的键…（Esc 取消）', false, true);
+      });
+
+      function findPublicPoolPageSizeControl() {
+        const candidates = findByPattern(/^\d+条\/页$/).filter((el) => {
+          const r = el.getBoundingClientRect();
+          return isVisible(el) && r.bottom >= window.innerHeight * 0.65 && r.right >= window.innerWidth * 0.55;
+        });
+        return candidates.sort((a, b) => {
+          const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+          return (rb.bottom - ra.bottom) || (rb.right - ra.right) || (elArea(a) - elArea(b));
+        })[0] || null;
+      }
+      function publicPoolPageSize(el) {
+        const m = normalizeText(el && (el.innerText || el.textContent) || '').match(/^(\d+)条\/页$/);
+        return m ? Number(m[1]) : 0;
+      }
+      function publicPoolRowsSignature() {
+        const rows = Array.from(document.querySelectorAll('.ant-table-tbody tr, table tbody tr, [role="rowgroup"] [role="row"]'))
+          .filter((row) => isVisible(row) && normalizeText(row.innerText || row.textContent));
+        if (!rows.length) return '';
+        return rows.length + '|' + normalizeText(rows[0].innerText || rows[0].textContent) + '|' +
+          normalizeText(rows[rows.length - 1].innerText || rows[rows.length - 1].textContent);
+      }
+      function publicPoolTableRoot() {
+        return document.querySelector('.ant-table-wrapper, .ant-table, [role="grid"]') ||
+          document.querySelector('table') || document.querySelector('[role="rowgroup"]');
+      }
+
+      const startBulkDial = async () => {
+        if (bulkDialButton.disabled) return;
+        const pauseTexts = ['停止连续拨打', '暂停拨号', '暂停外呼', '停止拨号'];
+        if (pauseTexts.some((label) => findClickablesByText(label).length)) {
+          toast('云客连续外呼已经在运行，没有重复启动。', false);
+          return;
+        }
+        const original = bulkDialButton.innerHTML;
+        let tableObserver = null;
+        bulkDialButton.disabled = true;
+        bulkDialButton.textContent = '正在检查每页数量…';
+        try {
+          let pageSizeControl = findPublicPoolPageSizeControl();
+          if (!pageSizeControl) throw new Error('没找到列表底部的“每页数量”控件；请确认当前在客户公海列表。');
+          let sizeOk = publicPoolPageSize(pageSizeControl) === 500;
+          const already500 = sizeOk;
+          const initialRowsSignature = publicPoolRowsSignature();
+          let sizeChangeRequestedAt = 0, tableMutationAt = 0;
+          if (!sizeOk) {
+            // 当前不是 500 时才打开分页下拉，避免已是 500 时误点开菜单并二次触发刷新。
+            realClick(getClickableAncestor(pageSizeControl) || pageSizeControl);
+            const opened = await waitUntil(() => findByPattern(/^500条\/页$/).some(isVisible), 5000, 100);
+            if (!opened) throw new Error('没打开每页数量菜单；没有全选，也没有拨打。');
+            const option500 = pickSmallest(findByPattern(/^500条\/页$/).filter(isVisible));
+            if (!option500) throw new Error('菜单中没有找到“500条/页”；没有全选，也没有拨打。');
+            const tableRoot = publicPoolTableRoot();
+            if (tableRoot && window.MutationObserver) {
+              try {
+                tableObserver = new MutationObserver(() => { tableMutationAt = Date.now(); });
+                tableObserver.observe(tableRoot, { childList: true, characterData: true, subtree: true });
+              } catch (e) { tableObserver = null; }
+            }
+            sizeChangeRequestedAt = Date.now();
+            if (!realClick(getClickableAncestor(option500) || option500)) throw new Error('点击“500条/页”失败；没有全选，也没有拨打。');
+            sizeOk = await waitUntil(() => {
+              const current = findPublicPoolPageSizeControl();
+              return publicPoolPageSize(current) === 500;
+            }, 12000, 120);
+          }
+          if (!sizeOk) throw new Error('无法确认页数已切到500条/页；为避免少选，已停止拨打。');
+          bulkDialButton.textContent = '正在等待500条列表加载…';
+          let previousRows = '', stableSince = 0;
+          const loaded = await waitUntil(() => {
+            const current = findPublicPoolPageSizeControl();
+            if (publicPoolPageSize(current) !== 500) { previousRows = ''; stableSince = 0; return false; }
+            const signature = publicPoolRowsSignature();
+            if (!signature) { previousRows = ''; stableSince = 0; return false; }
+            const refreshObserved = already500 || signature !== initialRowsSignature ||
+              (sizeChangeRequestedAt > 0 && tableMutationAt >= sizeChangeRequestedAt);
+            if (!refreshObserved) return false;
+            if (signature !== previousRows) { previousRows = signature; stableSince = 0; }
+            const busy = Array.from(document.querySelectorAll('.ant-spin-spinning, [aria-busy="true"], .ant-skeleton, [class*="loading"]'))
+              .some((el) => isVisible(el) && !el.closest('#yk_helper_panel, #yk_helper_fab, #yk_helper_toast'));
+            if (busy) { stableSince = 0; return false; }
+            if (!stableSince) stableSince = Date.now();
+            return Date.now() - stableSince >= 1500;
+          }, 45000, 180);
+          if (tableObserver) { tableObserver.disconnect(); tableObserver = null; }
+          if (!loaded) throw new Error('500条/页尚未加载完成；为避免全选旧数据，已停止拨打。');
+
+          bulkDialButton.textContent = '500条已加载，正在选择全部…';
+          // 云客列表上方的「选择全部」链接是它实际使用的批量选择入口；表格表头复选框
+          // 在不同布局下可能只选本页部分行，且视觉勾选状态不稳定，因此以页面确认文案为准。
+          const selectAll = pickSmallest(findByPattern(/^选择全部$/));
+          if (!selectAll) throw new Error('没找到列表上方的「选择全部」入口；没有选中任何客户，也没有开始拨打。');
+          if (!realClick(getClickableAncestor(selectAll) || selectAll)) throw new Error('「选择全部」点击失败；没有开始拨打。');
+          const selectionConfirmed = await waitUntil(() => findByPattern(/^取消选择$/).length > 0, 6000, 100);
+          if (!selectionConfirmed) throw new Error('云客没有显示「取消选择」确认，无法确认客户已选中；已停止拨打。');
+          bulkDialButton.textContent = '已全选，正在启动连续外呼…';
+          await sleep(120);
+
+          const startCandidates = findClickablesByText('连续外呼').filter((el) => {
+            const target = getClickableAncestor(el);
+            return target && normalizeText(target.innerText || target.textContent) === '连续外呼' && !isDisabled(target);
+          });
+          const startButton = pickSmallest(startCandidates);
+          if (!startButton) throw new Error('列表已全选，但没找到云客「连续外呼」按钮。');
+          if (!realClick(getClickableAncestor(startButton))) throw new Error('云客「连续外呼」按钮点击失败。');
+          toast('✓ 已切到500条/页，列表加载完成并全选，云客连续外呼已启动。', false, true);
+        } catch (error) {
+          toast('⚠ ' + String(error && error.message || error), true, true);
+        } finally {
+          if (tableObserver) { tableObserver.disconnect(); tableObserver = null; }
+          bulkDialButton.disabled = false;
+          bulkDialButton.innerHTML = original;
+        }
+      };
+      if (bulkDialButton) bulkDialButton.addEventListener('click', startBulkDial);
 
       function handleEdit(action, hotkey) {
         const cur = getLayoutState();
@@ -3534,6 +3977,7 @@
       // ---- 动作录制：全局监听只绑一次（initUI 可能被 observer 重复调用）----
       let capturingMacro = null; // 正在为哪个宏捕获触发键
       let capturingExec = false; // 正在捕获「立即执行」快捷键
+      let capturingBulkDialKey = false; // 正在捕获「全选并开始拨打」快捷键
       if (!window.__ykRecBound) {
         window.__ykRecBound = true;
         // 点击记录
@@ -3752,6 +4196,7 @@
             autoSeconds: [0, 3, 5, 8].includes(Number(current.autoSeconds)) ? Number(current.autoSeconds) : 0,
             linkFlow: current.linkFlow || '', lastFlow: current.lastFlow || 'F',
             execKey: String(current.execKey || 'Enter').slice(0, 32),
+            bulkDialKey: String(current.bulkDialKey || 'F9').slice(0, 32),
             focusOnLink: current.focusOnLink !== false,
             connectNotice: current.connectNotice !== false,
           },
@@ -3796,6 +4241,7 @@
               linkFlow: a.linkFlow === '' ? '' : (validFlowKeys.has(a.linkFlow) ? a.linkFlow : ''),
               lastFlow: validFlowKeys.has(a.lastFlow) ? a.lastFlow : 'F',
               execKey: cleanKey(a.execKey, 'Enter'),
+              bulkDialKey: cleanKey(a.bulkDialKey, 'F9'),
               focusOnLink: typeof a.focusOnLink === 'boolean' ? a.focusOnLink : true,
               connectNotice: typeof a.connectNotice === 'boolean' ? a.connectNotice : true,
               useKeywords: false,
@@ -4182,7 +4628,8 @@
         if (!force && key === ykStatusIdentityKey) return;
         ykStatusIdentityKey = key;
         const phone = String(ykNumMap[ph.number] || ph.number || '');
-        const name = String(ph.name || (ykCallCtx[phone] && ykCallCtx[phone].name) || '');
+        const callContext = ykCallCtx[String(ph.number)] || ykCallCtx[phone] || null;
+        const name = String(ph.name || (callContext && callContext.name) || '');
         const phoneLabel = (PH_META[ph.state] ? PH_META[ph.state].dot : '⚪ 暂无通话') + ([name, phone].filter(Boolean).join(' ') ? ' · ' + [name, phone].filter(Boolean).join(' ') : '');
         const crmPhone = grabCrmNumber();
         const crmName = grabCrmName(crmPhone);
@@ -4198,6 +4645,8 @@
         let match = '⚠ 手机状态没有客户号码，无法核对';
         if (phone && currentCustomerDetailMatches(name, phone)) {
           match = '✅ 右侧客户详情手机号一致';
+        } else if (callContext && currentCustomerDetailMatchesCapture(name, callContext.crmDisplayPhone)) {
+          match = '✅ 当前客户与拨出时快照一致';
         } else if (phone || name) {
           const tab = matchCallTab(callTabKeys(name, phone));
           if (tab && isTabActive(tab.el)) {
@@ -4225,10 +4674,14 @@
           if (ykNumFixTries >= 10) return;
           ykNumFixTries++;
           const real = grabCrmNumber();
-          const name = grabCrmName(real || row.number);
-          // [v1.18.2] 记下这通是谁（姓名 + 真实号），联动前拿来对齐页签
-          if (real || name) {
-            const ctx = { num: real || String(row.number || ''), name: name || '', at: Date.now() };
+          const detailIdentity = readCrmDetailIdentity();
+          const name = grabCrmName(real || row.number) || detailIdentity.name;
+          // [v1.18.2] 保存号码映射；回拨中间号场景再保存拨出时详情中的姓名 + 脱敏号码快照。
+          if (real || name || detailIdentity.phone) {
+            const ctx = {
+              num: real || String(row.number || ''), name: name || '',
+              crmDisplayPhone: detailIdentity.phone || real || '', at: Date.now(),
+            };
             if (row.number) ykCallCtx[String(row.number)] = ctx;
             if (real) ykCallCtx[String(real)] = ctx;
             ykCtxPrune();
@@ -4323,11 +4776,16 @@
         const ph = PW.__ykPhRow || {};
         const fresh = !!(ph.alive && ph.hbAt > 0 && Date.now() - ph.hbAt <= 20000);
         const active = fresh && /^(dialing|ringing|answered|incoming)$/i.test(String(ph.state || ''));
+        const computerHangup = fresh && /^(dialing|ringing)$/i.test(String(ph.state || ''));
         const ended = fresh && /^(hangup|ended|idle|none|disconn|over|finish)$/i.test(String(ph.state || ''));
         if (manualHangupPending && ended) manualHangupPending = false;
         if (!manualHangupButton || !manualHangupStatus) return;
         manualHangupButton.disabled = !active || manualHangupPending;
         manualHangupButton.dataset.active = active ? 'true' : 'false';
+        manualHangupButton.title = computerHangup ? '电脑直接点击云客挂断，结束当前通话' : '手机当前通话结束';
+        manualHangupButton.setAttribute('aria-label', computerHangup ? '电脑挂断当前通话' : '挂断当前手机通话');
+        const buttonLabel = manualHangupButton.querySelector('.yk-hangup-label');
+        if (buttonLabel) buttonLabel.textContent = computerHangup ? '电脑挂断' : '挂断手机';
         if (manualHangupPending) manualHangupStatus.textContent = '挂断处理中 · 等待手机状态回执';
         else if (active) manualHangupStatus.textContent = '手机显示' + (ph.state === 'answered' ? '通话中' : ph.state === 'incoming' ? '来电中' : '拨号中') + ' · ' + ([ph.name, ph.number].filter(Boolean).join(' ') || '当前号码');
         else if (ended) manualHangupStatus.textContent = '手机已结束通话 · 可继续选结果并提交';
@@ -4341,6 +4799,25 @@
           syncManualHangupControl();
           if (origin !== 'flow') toast('当前没有收到手机正在通话的有效状态，未发送挂断请求。', true);
           return Promise.resolve(phoneCallEndedFresh());
+        }
+        if (/^(dialing|ringing)$/i.test(String(ph.state || ''))) {
+          const hangBtn = HANGUP_TEXTS.flatMap((label) => findClickablesByText(label))
+            .filter((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent)))
+            .map(getClickableAncestor).find((el) => el && isVisible(el) && !isDisabled(el));
+          if (!hangBtn) {
+            ykStatusUpdate({ progress: '电脑未找到云客挂断控件', outcome: '挂断未执行' });
+            toast('当前页面没有找到云客挂断按钮；请展开通话窗口后重试。', true, true);
+            return Promise.resolve(false);
+          }
+          if (!realClick(hangBtn)) {
+            toast('电脑点击云客挂断失败，请确认通话窗口仍打开。', true, true);
+            return Promise.resolve(false);
+          }
+          lastManualHangupCommandAt = Date.now();
+          lastCrmHangupSyncAt = lastManualHangupCommandAt;
+          ykStatusUpdate({ progress: '电脑已点击云客挂断', outcome: '不等待手机 APK 确认' });
+          toast('✓ 电脑已点击云客挂断', false, true);
+          return Promise.resolve(true);
         }
         const now = Date.now();
         if (now - lastManualHangupCommandAt < 6000) {
@@ -4453,9 +4930,16 @@
           return Array.isArray(list) ? list : [];
         } catch (e) { return []; }
       }
+      const MAX_PENDING_RESULT_EVENTS = 500;
       function writePendingList(list) {
-        try { localStorage.setItem('yk_pending_results', JSON.stringify(list.slice(0, 50))); } catch (e) {}
-        updatePendingLine();
+        try {
+          localStorage.setItem('yk_pending_results', JSON.stringify(list));
+          updatePendingLine();
+          return true;
+        } catch (e) {
+          console.error('[云客助手] 待补录队列写入失败；挂断事件应保留在中转，不推进游标', e);
+          return false;
+        }
       }
       function callIdFromSource(source) {
         const parts = String(source || '').split(':');
@@ -4496,25 +4980,43 @@
                 source: pending.source || list[existing].source || '',
                 t: pending.t || list[existing].t || '',
               });
-            } else list.unshift(Object.assign({}, pending, metadata || {}));
+            } else {
+              if (list.length >= MAX_PENDING_RESULT_EVENTS) {
+                console.error('[云客助手] 待补录队列已达上限，拒绝消费新的挂断事件', id);
+                return false;
+              }
+              list.unshift(Object.assign({}, pending, metadata || {}));
+            }
           }
-          localStorage.setItem('yk_pending_results', JSON.stringify(list.slice(0, 50)));
-        } catch (e) {}
-        updatePendingLine();
+          return writePendingList(list);
+        } catch (e) {
+          console.error('[云客助手] 无法保存待补录事件', e);
+          return false;
+        }
       }
       function removePendingEvent(id) {
         if (id == null || id === '') return;
         try {
           const list = JSON.parse(localStorage.getItem('yk_pending_results') || '[]');
-          const completed = list.find((x) => String(x.id) === String(id));
+          const index = list.findIndex((x) => String(x.id) === String(id));
+          const completed = index >= 0 ? list[index] : null;
+          if (completed) {
+            list[index] = Object.assign({}, completed, { state: 'confirmed-cleanup', lastError: 'CRM 已确认保存；正在清理本地事件记录', updatedAt: Date.now() });
+            if (!writePendingList(list)) return;
+          }
+          let processedEvents = [];
+          try { processedEvents = JSON.parse(localStorage.getItem('yk_link_processed_events_v1') || '[]'); } catch (e2) {}
+          if (!Array.isArray(processedEvents)) processedEvents = [];
+          processedEvents = [String(id)].concat(processedEvents.filter((x) => String(x) !== String(id))).slice(0, 1000);
+          localStorage.setItem('yk_link_processed_events_v1', JSON.stringify(processedEvents));
           if (completed && completed.callId) {
             let seen = [];
-            try { seen = JSON.parse(localStorage.getItem('yk_link_processed_calls_v1') || '[]'); } catch (e2) {}
+            try { seen = JSON.parse(localStorage.getItem('yk_link_processed_calls_v1') || '[]'); } catch (e3) {}
             if (!Array.isArray(seen)) seen = [];
             seen = [String(completed.callId)].concat(seen.filter((x) => String(x) !== String(completed.callId))).slice(0, 200);
             localStorage.setItem('yk_link_processed_calls_v1', JSON.stringify(seen));
           }
-          localStorage.setItem('yk_pending_results', JSON.stringify(list.filter((x) => String(x.id) !== String(id))));
+          if (!writePendingList(list.filter((x) => String(x.id) !== String(id)))) return;
         } catch (e) {}
         updatePendingLine();
       }
@@ -4539,7 +5041,8 @@
           return;
         }
         const lines = list.slice(0, 8).map((x) => {
-          const state = x.state === 'submit-uncertain' || x.state === 'submitting' ? '需核对是否已保存' : '自动补录中';
+          const state = x.state === 'confirmed-cleanup' ? 'CRM 已保存，清理待重试' :
+            (x.state === 'submit-uncertain' || x.state === 'submitting' ? '需核对是否已保存' : '自动补录中');
           return '· ' + (x.num || '号码未知') + (x.reason ? '（' + x.reason + '）' : '') + ' · ' + state + (x.lastError ? '：' + x.lastError : '');
         });
         toast('📋 挂断跟进 ' + list.length + ' 条（最新在前）：\n' + lines.join('\n') + (list.length > 8 ? '\n…' : '') + '\n—— 核对完后点这里清空', false, true);
@@ -4572,13 +5075,25 @@
         const list = readPendingList();
         const now = Date.now();
         for (const stale of list) {
+          // 从旧版升级时，只恢复因 15 分钟时限暂停的身份匹配事件；
+          // 提交不确定、客户身份冲突等其他 needs-review 项不自动重放。
+          if (stale && stale.state === 'needs-review' && /挂断事件超过 15 分钟/.test(String(stale.lastError || ''))) {
+            const oldEventAt = Date.parse(stale.eventAt || stale.t || '') || 0;
+            if (oldEventAt && now - oldEventAt <= 24 * 60 * 60 * 1000) {
+              updatePendingEvent(stale.id, {
+                state: 'queued', attempts: 0, matchFailures: 0, nextRetryAt: now,
+                leaseUntil: 0, workerTab: '', lastError: '升级后恢复自动匹配，仍需唯一确认 CRM 客户',
+              });
+              continue;
+            }
+          }
           if (stale && stale.state === 'submitting' && Number(stale.leaseUntil || 0) <= now) {
             updatePendingEvent(stale.id, { state: 'submit-uncertain', leaseUntil: 0, lastError: '提交期间页面中断，需确认 CRM 是否已保存，系统不会重复提交' });
           }
         }
         const item = list.find((x) => {
           if (!x || !x.id) return false;
-          if (x.state === 'submitting' || x.state === 'submit-uncertain' || x.state === 'needs-review') return false;
+          if (x.state === 'submitting' || x.state === 'submit-uncertain' || x.state === 'needs-review' || x.state === 'confirmed-cleanup') return false;
           if (x.state === 'running' && Number(x.leaseUntil || 0) > now) return false;
           if (x.state === 'queued' && Number(x.updatedAt || 0) && now - Number(x.updatedAt) < 4000) return false;
           if (Number(x.nextRetryAt || 0) > now) return false;
@@ -4586,8 +5101,10 @@
         });
         if (!item) return;
         const eventAt = Date.parse(item.eventAt || item.t || '') || 0;
-        if (!eventAt || now - eventAt > 15 * 60 * 1000) {
-          updatePendingEvent(item.id, { state: 'needs-review', lastError: '挂断事件超过 15 分钟，需人工核对客户身份', leaseUntil: 0 });
+        // CRM 页签可能长时间停在其他客户。保留唯一号码核对与页签身份保护，
+        // 将自动重试窗口延长到 24 小时；正确客户页稍后打开时仍可自动补录。
+        if (!eventAt || now - eventAt > 24 * 60 * 60 * 1000) {
+          updatePendingEvent(item.id, { state: 'needs-review', lastError: '挂断事件超过 24 小时，需人工核对客户身份', leaseUntil: 0 });
           return;
         }
         const phone = String(item.crmNum || item.num || '').replace(/\D/g, '');
@@ -4617,7 +5134,7 @@
               return;
             }
             const customerName = String(item.crmName || '');
-            const aligned = await switchToCallTab(customerName, phone);
+            const aligned = await switchToCallTab(customerName, phone, String(item.crmDisplayPhone || ''));
             if (!aligned) {
               const failures = Number(item.matchFailures || 0) + 1;
               updatePendingEvent(item.id, {
@@ -4630,7 +5147,8 @@
               });
               return;
             }
-            const detailMatched = currentCustomerDetailMatches(customerName, phone);
+            const detailMatched = currentCustomerDetailMatches(customerName, phone) ||
+              currentCustomerDetailMatchesCapture(customerName, String(item.crmDisplayPhone || ''));
             const callTrace = hasVisibleText('通话结束') || hasVisibleText('已挂断') || hasVisibleText('已结束') ||
               hasVisibleText('呼叫结束') || hasVisibleText('通话中') ||
               findClickablesByText(...HANGUP_TEXTS).some((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent)));
@@ -4653,10 +5171,15 @@
             });
             const reason = String(item.reason || '');
             const noAnswer = /short|无人接听|未接|拒接|noans|no_answer|关机|空号|停机|呼转/i.test(reason);
+            const crmPageAlreadyEnded = hasVisibleText('通话结束') || hasVisibleText('已挂断') ||
+              hasVisibleText('已结束') || hasVisibleText('呼叫结束') ||
+              (!hasVisibleText('通话中') && !hasVisibleText('拨打中') &&
+                !findClickablesByText(...HANGUP_TEXTS).some((el) => !/请挂断|请先/.test(normalizeText(el.innerText || el.textContent))));
             await runFlow(flow, {
               trigger: '挂断事件自动补偿',
               gentleHangup: true,
-              pageSelfEnded: true, // 手机已挂断；补录时绝不点 CRM 挂断，防误伤下一通
+              // 只在 CRM 确已结束或手机已经拨出下一通时跳过页面挂断；否则让流程立即同步 CRM。
+              pageSelfEnded: crmPageAlreadyEnded || phoneMovedOn(eventAt),
               eventAge: Date.now() - eventAt,
               matchPhone: phone,
               noAnswer,
@@ -4934,7 +5457,9 @@
       let ykLastEventAt = Date.now();
       let ykRelaySuspendedUntil = 0; // [v1.14.9] 402 熔断：云端被隔离时停止轮询，避免空烧资源点
       let ykRelaySuspendedNotified = false;
+      let pendingQueueWriteErrorToastAt = 0;
       workerEvery(200, () => {
+        processManualHangupCrmSync();
         let st = loadAuto();
         // [v1.24.0] 空联动配置不再让挂断事件一直留在服务器却不处理；使用用户一直采用的无意向默认流程。
         if (!st.linkFlow) {
@@ -4947,12 +5472,18 @@
         // 连续 10 分钟没有新事件自动降频（下班挂机不空转），一来事件立即恢复极速
         if (ykPollBusy > 0 && Date.now() - ykLastEventAt > 600000) return;
         ykPollBusy++;
-        relayFetch(RELAY_URL + '?select=id,event_type,source,created_at&order=id.desc&limit=50', {
+        let pollCursor = Number(linkLastSeenId) || 0;
+        try { pollCursor = Math.max(pollCursor, parseInt(localStorage.getItem('yk_link_last_id_v2') || '0', 10) || 0); } catch (e) {}
+        const hasCursor = linkBaselined || pollCursor > 0;
+        const query = hasCursor
+          ? '?select=id,event_type,source,created_at&id=gt.' + pollCursor + '&order=id.asc&limit=50'
+          : '?select=id,event_type,source,created_at&order=id.desc&limit=50';
+        relayFetch(RELAY_URL + query, {
           headers: { 'x-wb-webapp-access-key': RELAY_KEY },
         }).then((rows) => withEventLock(async () => {
           ykRelaySuspendedNotified = false;
           if (!Array.isArray(rows) || !rows.length) return;
-          const latest = rows[0].id;
+          const latest = Number((hasCursor ? rows[rows.length - 1] : rows[0]).id);
           if (latest > linkLastSeenId) ykLastEventAt = Date.now(); // 有新流量=手机活跃，保持极速轮询
           if (!linkBaselined) {
             linkBaselined = true;
@@ -4963,7 +5494,7 @@
             if (shared > 0) {
               linkLastSeenId = shared;
             } else {
-              const recent = rows.filter((r) => r.event_type === 'hangup' &&
+              const recent = rows.filter((r) => (r.event_type === 'hangup' || r.event_type === 'ended') &&
                 (Date.now() - (Date.parse(r.created_at) || 0)) <= 120000)
                 .sort((a, b) => Number(a.id) - Number(b.id));
               linkLastSeenId = recent.length ? Number(recent[0].id) - 1 : Number(latest);
@@ -4979,16 +5510,25 @@
           try { sharedId = parseInt(localStorage.getItem('yk_link_last_id_v2') || '0', 10) || 0; } catch (e) {}
           const linkFloor = Math.max(linkLastSeenId, sharedId);
           if (latest <= linkFloor) { linkLastSeenId = linkFloor; return; }
-          let freshRows = rows.filter((r) => r.id > linkFloor && r.event_type === 'hangup')
+          // Android reports unanswered calls as `hangup`, but connected calls as `ended`.
+          // Both mean this call is over and should enter the same guarded CRM follow-up flow.
+          let freshRows = rows.filter((r) => r.id > linkFloor && (r.event_type === 'hangup' || r.event_type === 'ended'))
             .sort((a, b) => Number(a.id) - Number(b.id));
           // 手机端对挂断事件重试投递时 callId 不变；同一通已入队/已保存则吞掉重复投递。
           if (freshRows.length) {
             let processedCalls = [];
+            let processedEventIds = [];
             try { processedCalls = JSON.parse(localStorage.getItem('yk_link_processed_calls_v1') || '[]'); } catch (e) {}
             if (!Array.isArray(processedCalls)) processedCalls = [];
-            const pendingCalls = new Set(readPendingList().map((x) => String(x.callId || '')).filter(Boolean));
+            try { processedEventIds = JSON.parse(localStorage.getItem('yk_link_processed_events_v1') || '[]'); } catch (e) {}
+            if (!Array.isArray(processedEventIds)) processedEventIds = [];
+            const pendingRows = readPendingList();
+            const pendingEvents = new Set(pendingRows.map((x) => String(x.id || '')).filter(Boolean));
+            const pendingCalls = new Set(pendingRows.map((x) => String(x.callId || '')).filter(Boolean));
             freshRows = freshRows.filter((r) => {
+              if (processedEventIds.includes(String(r.id))) return false;
               const callId = callIdFromSource(r.source);
+              if (pendingEvents.has(String(r.id))) return false;
               return !callId || (!processedCalls.includes(callId) && !pendingCalls.has(callId));
             });
           }
@@ -5031,7 +5571,14 @@
           }
           const consumeThrough = freshRows.length ? Number(freshRows[0].id) : Number(latest);
           // 先落入浏览器本地持久队列，再推进共享游标/删中转行；页面短暂失配或切后台也不会丢事件。
-          if (freshRows.length) addPendingList([freshRows[0]]);
+          if (freshRows.length && !addPendingList([freshRows[0]])) {
+            ykStatusUpdate({ progress: '待补录队列暂不可写，挂断事件保留在中转', outcome: '未推进事件游标；存储恢复后会自动重试' });
+            if (Date.now() - (pendingQueueWriteErrorToastAt || 0) > 15000) {
+              pendingQueueWriteErrorToastAt = Date.now();
+              toast('⚠ 无法保存待补录记录，已暂停消费手机挂断事件；请检查浏览器存储空间。', true, true);
+            }
+            return;
+          }
           linkLastSeenId = consumeThrough;
           try { localStorage.setItem('yk_link_last_id_v2', String(consumeThrough)); } catch (e) {}
           // 只清理到本轮消费位置，后续挂断事件留待下一轮。
@@ -5063,12 +5610,18 @@
               };
               const duplicateRows = freshRows.filter(sameManualCall);
               if (duplicateRows.length) {
+                const confirmedEventAt = Date.parse(duplicateRows[0].created_at) || Date.now();
+                manualFlowMarker.eventAt = confirmedEventAt;
+                manualFlowMarker.crmSyncPending = true;
+                if (PW.__YK_MANUAL_FLOW_HANGUP__ && PW.__YK_MANUAL_FLOW_HANGUP__.at === manualFlowMarker.at) {
+                  Object.assign(PW.__YK_MANUAL_FLOW_HANGUP__, manualFlowMarker);
+                }
+                manualHangupCrmSyncJob = manualFlowMarker;
+                try { localStorage.setItem('yk_manual_flow_hangup_v1', JSON.stringify(manualFlowMarker)); } catch (e) {}
                 freshRows = freshRows.filter((r) => !duplicateRows.includes(r));
                 for (const r of duplicateRows) removePendingEvent(r.id);
-                if (PW.__YK_MANUAL_FLOW_HANGUP__ === manualFlowMarker) PW.__YK_MANUAL_FLOW_HANGUP__ = null;
-                try { localStorage.removeItem('yk_manual_flow_hangup_v1'); } catch (e) {}
-                ykStatusUpdate({ progress: '手机挂断已由当前手动流程处理', outcome: '已跳过重复自动联动' });
-                toast('📱 手机挂断已由当前手动流程处理，已跳过重复提交。', false, true);
+                ykStatusUpdate({ progress: '已收到本通手机挂断回执', outcome: '等待当前结果操作结束后同步 CRM 挂断，不重复提交' });
+                toast('📱 已收到本通手机挂断回执，将自动同步 CRM 页面。', false, true);
               }
             }
           }
@@ -5125,12 +5678,14 @@
           const ctxRow = (evPhone && ykCallCtx[String(evPhone)]) || (matchNum && ykCallCtx[String(matchNum)]) || null;
           const ctxName = (ctxRow && ctxRow.name) || '';
           const ctxNum = (ctxRow && ctxRow.num) || matchNum || evPhone || '';
+          const ctxDisplayPhone = (ctxRow && ctxRow.crmDisplayPhone) || '';
           const ctxArrivedAfterCall = !!(ctxRow && evAt && ctxRow.at && ctxRow.at > evAt + 1500);
           updatePendingEvent(freshRows[0].id, {
             state: 'queued',
             // 下一通的页面快照不能冒充本通客户；晚到快照只保留挂断事件原号码，等待唯一匹配。
             crmName: ctxArrivedAfterCall ? '' : ctxName,
             crmNum: ctxArrivedAfterCall ? (matchNum || evPhone || '') : ctxNum,
+            crmDisplayPhone: ctxArrivedAfterCall ? '' : ctxDisplayPhone,
             flowKey: flow.hotkey,
             eventAt: evAt,
             reason: evReason || '',
@@ -5144,28 +5699,36 @@
           }
           if (ctxArrivedAfterCall) {
             console.warn('[云客助手][联动对齐] 客户快照晚于挂断事件，可能已属于下一通，停止自动处理', ctxName || ctxNum);
+            const crmHangupSynced = await syncVisibleCrmHangupForFreshPhoneEvent(evAt);
             ykStatusUpdate({
               phoneCustomer: [ctxName, ctxNum].filter(Boolean).join(' '),
               event: '手机挂断' + (evReason ? ' · ' + evReason : ''), eventAt: evAt || Date.now(),
-              progress: '客户身份快照时间晚于挂断事件', outcome: '为避免写错客户，已暂停并放入待补录',
+              progress: crmHangupSynced ? '电脑通话已同步挂断' : '客户身份快照时间晚于挂断事件',
+              outcome: '客户身份未确认，跟进暂停并放入待补录',
             });
-            toast('🛑 手机已进入下一通，客户身份快照晚于挂断事件；为防标错人，本次已停止并放入待补录。', true, true);
+            toast(crmHangupSynced
+              ? '📵 已同步电脑挂断；客户身份未确认，跟进已安全留在待补录。'
+              : '🛑 客户身份快照晚于挂断事件；为防标错人，本次已停止并放入待补录。', true, true);
             addPendingList(freshRows);
             return;
           }
           let alignedTab = null;
-          try { alignedTab = await switchToCallTab(ctxName, ctxNum); } catch (e) { alignedTab = null; }
+          try { alignedTab = await switchToCallTab(ctxName, ctxNum, ctxDisplayPhone); } catch (e) { alignedTab = null; }
           if (alignedTab) {
             console.log('[云客助手][联动对齐] 已切到手机那通的页签：' + alignedTab + '（' + (ctxName || ctxNum) + '）');
             toast('🎯 已对齐手机客户「' + (ctxName || alignedTab) + '」', false, true);
           } else {
             console.warn('[云客助手][联动对齐] 无法唯一匹配手机客户页签/详情，停止 CRM 同步/提交', ctxName || ctxNum || evPhone || '无号码');
+            const crmHangupSynced = await syncVisibleCrmHangupForFreshPhoneEvent(evAt);
             ykStatusUpdate({
               phoneCustomer: [ctxName, ctxNum || evPhone].filter(Boolean).join(' '),
               event: '手机挂断' + (evReason ? ' · ' + evReason : ''), eventAt: evAt || Date.now(),
-              progress: '手机 APK 已挂断；CRM 客户页未匹配', outcome: '为防误操作，未点 CRM 挂断或提交；事件已保留待补录',
+              progress: crmHangupSynced ? '手机与电脑通话已挂断；客户未匹配' : '手机 APK 已挂断；CRM 客户页未匹配',
+              outcome: '跟进未提交，事件已保留待补录',
             });
-            toast('📱 手机 APK 已挂断；CRM 未能唯一匹配「' + (ctxName || ctxNum || evPhone || '未知') + '」，电脑暂不点客户页的挂断/提交，事件已保留待补录。', true, true);
+            toast(crmHangupSynced
+              ? '📵 手机和电脑通话已同步挂断；CRM 客户未能唯一匹配，跟进已保留待补录。'
+              : '📱 手机 APK 已挂断；CRM 未能唯一匹配「' + (ctxName || ctxNum || evPhone || '未知') + '」，未提交跟进，事件已保留待补录。', true, true);
             addPendingList(freshRows);
             return;
           }
@@ -5870,6 +6433,41 @@
           return;
         }
 
+        if (capturingBulkDialKey) {
+          if (e.key === 'Escape') {
+            capturingBulkDialKey = false;
+            if (bulkDialKeyButton) bulkDialKeyButton.classList.remove('listening');
+            renderBulkDialKey();
+            toast('已取消快捷键设置');
+            e.preventDefault();
+            return;
+          }
+          if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Dead', 'NumLock', 'ScrollLock'].includes(e.key)) return;
+          if (e.ctrlKey || e.altKey || e.metaKey) return;
+          const pressedKey = String(e.key || '').toLowerCase();
+          const physicalKey = String(e.code || '').toLowerCase();
+          const semanticKey = keyCodeSemantic(e.code || e.key);
+          const pressedKeys = new Set([pressedKey, physicalKey, semanticKey]);
+          const layoutNow = getLayoutState();
+          const flowConflict = FLOWS.find((f) => pressedKeys.has(String(getEffectiveKey(f, layoutNow.keys)).toLowerCase()));
+          const macroConflict = loadMacros().find((m) => m.key && pressedKeys.has(String(m.key).toLowerCase()));
+          const execConflict = pressedKeys.has(String(loadAuto().execKey || 'Enter').toLowerCase());
+          if (flowConflict || macroConflict || execConflict) {
+            toast('这个键已用于' + (flowConflict ? '跟进结果「' + flowDisplayName(flowConflict, layoutNow.renames) + '」' : macroConflict ? '动作「' + macroConflict.name + '」' : '立即执行') + '，请换一个键。', true, true);
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+          e.preventDefault();
+          e.stopPropagation();
+          const s2 = loadAuto(); s2.bulkDialKey = e.code || e.key; saveAuto(s2);
+          capturingBulkDialKey = false;
+          if (bulkDialKeyButton) bulkDialKeyButton.classList.remove('listening');
+          renderBulkDialKey();
+          toast('✓ 全选并开始拨打快捷键已设为 ' + keyCodeDisplay(e.code || e.key));
+          return;
+        }
+
         if (e.ctrlKey && e.shiftKey && (e.key === 'Y' || e.key === 'y')) {
           e.preventDefault();
           panel.style.display = panel.style.display === 'flex' ? 'none' : 'flex';
@@ -5910,6 +6508,13 @@
         if (isTyping || e.isComposing || e.keyCode === 229 || e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
         // 匹配触发键：用 e.key 全键比较（数字/字母/符号/F键均可），大小写不敏感
         const pressed = (e.key || '').toLowerCase();
+        const bulkKey = String(loadAuto().bulkDialKey || 'F9').toLowerCase();
+        if (bulkKey === String(e.code || '').toLowerCase() || bulkKey === pressed || bulkKey === keyCodeSemantic(e.code || '').toLowerCase()) {
+          e.preventDefault();
+          e.stopPropagation();
+          startBulkDial();
+          return;
+        }
         // 倒计时浮层挂着时：按「立即执行」键 = 直接执行（不用等倒计时走完）
         if (autoPendingFlow && overlay.style.display === 'block' &&
             pressed === String(loadAuto().execKey || 'Enter').toLowerCase()) {
